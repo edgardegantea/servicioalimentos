@@ -12,7 +12,7 @@ class Checkout extends BaseController
     public function process()
     {
         $json = $this->request->getJSON();
-        
+
         if (empty($json->items)) {
             return $this->response->setJSON(['status' => 'error', 'message' => 'Carrito vacío.']);
         }
@@ -22,9 +22,10 @@ class Checkout extends BaseController
         $productModel   = new ProductModel();
         $db             = \Config\Database::connect();
 
-        // 1. Detectar si hay una orden activa (Mesa ocupada) o es nueva
+        // 1. Detectar si hay una orden activa en sesión (Mesa ocupada)
         $activeOrderId = session()->get('active_order_id');
-        
+
+        // Iniciar Transacción
         $db->transStart();
 
         try {
@@ -32,33 +33,37 @@ class Checkout extends BaseController
             $currentOrderNumber = null;
 
             if ($activeOrderId) {
-                // --- ESCENARIO A: AGREGAR A ORDEN EXISTENTE ---
+                // CASO A: Mesa existente (Agregamos a lo que ya pidieron)
                 $orderId = $activeOrderId;
                 $existingOrder = $orderModel->find($orderId);
+
+                if (!$existingOrder) {
+                    // Si por alguna razón la orden en sesión ya no existe en BD
+                    throw new \Exception("La orden activa no fue encontrada. Intenta recargar la página.");
+                }
+
                 $currentOrderNumber = $existingOrder['order_number'];
-                
-                // No tocamos el encabezado todavía, solo agregaremos items
             } else {
-                // --- ESCENARIO B: ORDEN NUEVA (Venta Rápida) ---
+                // CASO B: Orden Nueva (Venta Rápida / Delivery)
                 $orderData = [
                     'order_number'   => $orderModel->generateOrderNumber(),
                     'user_id'        => auth()->id(),
-                    'table_id'       => null, // Es delivery/barra
+                    'table_id'       => null,
                     'status'         => 'pending',
-                    'subtotal'       => 0, // Se calculará abajo
+                    'subtotal'       => 0,
                     'total'          => 0,
-                    'payment_method' => 'cash' // Por defecto
+                    'payment_method' => 'cash'
                 ];
                 $orderModel->insert($orderData);
                 $orderId = $orderModel->getInsertID();
                 $currentOrderNumber = $orderData['order_number'];
             }
 
-            // 2. Insertar los Items y Descontar Stock
+            // 2. Insertar Items y Descontar Stock
             foreach ($json->items as $item) {
-                // Verificar Stock
+                // Verificación estricta de stock
                 if (!$productModel->hasStock($item->id, $item->qty)) {
-                    throw new \Exception("Stock insuficiente: " . $item->name);
+                    throw new \Exception("Stock insuficiente para: " . $item->name);
                 }
 
                 $orderItemModel->insert([
@@ -70,40 +75,44 @@ class Checkout extends BaseController
                     'status'       => 'pending'
                 ]);
 
-                // Descontar inventario
+                // Actualizar inventario
                 $productModel->updateStock($item->id, $item->qty);
             }
 
-            // 3. CRÍTICO: Recalcular el TOTAL REAL de la orden completa
-            // Sumamos TODO lo que hay en la tabla order_items para este ID
-            $calculated = $orderItemModel->selectSum('price * quantity', 'grand_total')
-                                         ->where('order_id', $orderId)
-                                         ->first();
-            
-            $realTotal = $calculated['grand_total'] ?? 0;
+            // 3. CÁLCULO DEL TOTAL (CORREGIDO)
+            // En lugar de usar selectSum complejo, traemos los items y sumamos en PHP.
+            // Esto evita el error de SQL y garantiza precisión.
+            $allItems = $orderItemModel->where('order_id', $orderId)->findAll();
 
-            // 4. Actualizar el encabezado de la orden con el nuevo total
+            $realTotal = 0;
+            foreach ($allItems as $row) {
+                $realTotal += ($row['price'] * $row['quantity']);
+            }
+
+            // 4. Actualizar el encabezado de la orden
             $orderModel->update($orderId, [
-                'subtotal' => $realTotal,
-                'total'    => $realTotal, // Aquí podrías sumar impuestos si usas
+                'subtotal'   => $realTotal,
+                'total'      => $realTotal,
                 'updated_at' => date('Y-m-d H:i:s')
             ]);
 
+            // Finalizar transacción
             $db->transComplete();
 
             if ($db->transStatus() === false) {
-                return $this->response->setJSON(['status' => 'error', 'message' => 'Error en BD']);
+                // Si hubo un error interno en la base de datos
+                return $this->response->setJSON(['status' => 'error', 'message' => 'Error al guardar en la base de datos.']);
             }
 
-            // Si es venta rápida (sin mesa), limpiamos sesión por si acaso
+            // Limpiar sesión solo si era venta rápida
             if (!$activeOrderId) {
                 session()->remove('active_order_id');
             }
 
             return $this->response->setJSON([
-                'status'  => 'success', 
+                'status'  => 'success',
                 'folio'   => $currentOrderNumber,
-                'total'   => $realTotal // Devolvemos el total actualizado
+                'total'   => $realTotal
             ]);
 
         } catch (\Exception $e) {
